@@ -33,6 +33,7 @@ NB = [(di, dj) for di in (-2, -1, 0, 1, 2) for dj in (-2, -1, 0, 1, 2)
 RIO_BUFFER = 10.0         # RIO below this is penalised in proportion to w_risk
 BERG_SOFT_KM = 45.0       # penalty zone beyond the hard exclusion radius
 BERG_PENALTY_T = 3.0      # t-fuel-equivalent at the edge of the hard zone
+BERG_INSIDE_T = 40.0      # per-cell cost inside an exclusion zone when clearance has to be relaxed
 
 
 @dataclass
@@ -84,9 +85,10 @@ class Environment:
 class BergField:
     """Moving iceberg exclusion zones from the drift forecast."""
 
-    def __init__(self, bergs: list[dict], step_h: float, margin_km: float = 9.26):
+    def __init__(self, bergs: list[dict], step_h: float, margin_km: float = 9.26, hard: bool = True):
         self.step_h = step_h
         self.margin_km = margin_km
+        self.hard = hard  # False: exclusion zones become a steep penalty instead of a wall
         self.tracks = [np.asarray(b["forecast"]) for b in bergs]
         self.sigma = []
         self.radius = []
@@ -136,7 +138,10 @@ class BergField:
             d = math.hypot(x - px, y - py)
             r = self.exclusion_km(bi, t_h)
             if d < r:
-                return math.inf
+                if self.hard:
+                    return math.inf
+                pen += BERG_INSIDE_T * (1.0 + (r - d) / r)
+                continue
             if d < r + BERG_SOFT_KM:
                 pen += BERG_PENALTY_T * (1.0 - (d - r) / BERG_SOFT_KM)
         return pen
@@ -282,20 +287,22 @@ def evaluate(env: Environment, path, req: RouteRequest, berg_scn: list[dict] | N
         # densify in time so fast legs are not skipped
         tq = np.arange(0, tt[-1] + 0.5, 0.5)
         qx, qy = np.interp(tq, tt, px), np.interp(tq, tt, py)
+        def cpa(track):
+            tr = np.asarray(track)
+            f = np.clip(tq / step_h, 0, len(tr) - 1)
+            k0 = np.floor(f).astype(int)
+            k1 = np.minimum(k0 + 1, len(tr) - 1)
+            w = (f - k0)[:, None]
+            bp = tr[k0] * (1 - w) + tr[k1] * w
+            d = np.hypot(qx - bp[:, 0], qy - bp[:, 1]) - b["length_m"] / 2000.0
+            m = int(np.argmin(d))
+            return round(float(d[m]), 1), round(float(tq[m]), 1)
+
         for b in berg_scn:
-            for key in ("forecast", "truth"):
-                tr = np.asarray(b[key])
-                f = np.clip(tq / step_h, 0, len(tr) - 1)
-                k0 = np.floor(f).astype(int)
-                k1 = np.minimum(k0 + 1, len(tr) - 1)
-                w = (f - k0)[:, None]
-                bp = tr[k0] * (1 - w) + tr[k1] * w
-                d = np.hypot(qx - bp[:, 0], qy - bp[:, 1]) - b["length_m"] / 2000.0
-                m = int(np.argmin(d))
-                if key == "forecast":
-                    rec = {"id": b["id"], "cpa_km": round(float(d[m]), 1), "t_h": round(float(tq[m]), 1)}
-                else:
-                    rec["cpa_truth_km"] = round(float(d[m]), 1)
+            dist_f, t_f = cpa(b["forecast"])
+            rec = {"id": b["id"], "cpa_km": dist_f, "t_h": t_f, "cpa_truth_km": None}
+            if len(b.get("truth") or []):  # verifying track exists only in hindcast (simulation) mode
+                rec["cpa_truth_km"] = cpa(b["truth"])[0]
             clear.append(rec)
         clear.sort(key=lambda r: r["cpa_km"])
 
@@ -315,7 +322,7 @@ def evaluate(env: Environment, path, req: RouteRequest, berg_scn: list[dict] | N
             "ice_nm": round(sum(1 for p in pts if p["sic"] > 0.15) * C.CELL_KM / 1.852, 0),
             "beyond_forecast_horizon": beyond_horizon,
             "min_berg_cpa_km": clear[0]["cpa_km"] if clear else None,
-            "min_berg_cpa_truth_km": min((c["cpa_truth_km"] for c in clear), default=None),
+            "min_berg_cpa_truth_km": min((c["cpa_truth_km"] for c in clear if c["cpa_truth_km"] is not None), default=None),
             "bergs_within_10nm": sum(1 for c in clear if c["cpa_km"] < 18.52),
         },
         "berg_clearance": clear[:8],
@@ -365,15 +372,34 @@ def alternative_profiles(req: RouteRequest):
     ]
 
 
+def _solve(env, start, goal, req: RouteRequest, berg_scn: dict | None):
+    """A* with hard iceberg exclusion; if that leaves no route (e.g. a grounded berg in the only
+    approach to a station), retry with the zones as a steep penalty so the least-bad passage is
+    found and flagged. POLARIS ice limits are never relaxed."""
+    field = lambda hard: BergField(berg_scn["bergs"], berg_scn["step_h"], req.berg_margin_nm * 1.852, hard) if berg_scn else None
+    path, n = astar(env, start, goal, req, field(True), "optimal")
+    if path is None and berg_scn and req.avoid_bergs:
+        path, n2 = astar(env, start, goal, req, field(False), "optimal")
+        return path, n + n2, path is not None
+    return path, n, False
+
+
+def _relaxed_warning(ev: dict, req: RouteRequest, label: str) -> str:
+    worst = min(ev["berg_clearance"], key=lambda c: c["cpa_km"]) if ev["berg_clearance"] else None
+    where = (f" It passes {max(worst['cpa_km'], 0) / 1.852:.1f} nm from the edge of iceberg {worst['id']} "
+             f"at about +{worst['t_h']:.0f} h" if worst else "")
+    return (f"{label}: no track keeps the required iceberg clearance ({req.berg_margin_nm:g} nm plus the berg's "
+            f"drift uncertainty).{where}. Reduce speed and navigate that stretch by radar and visual watch.")
+
+
 def plan(store, sic_slices, req: RouteRequest, berg_scn: dict | None) -> dict:
     env = Environment(store, sic_slices, req.day, req)
     start = env.snap(*req.origin)
     goal = env.snap(*req.dest)
-    bergs = BergField(berg_scn["bergs"], berg_scn["step_h"], req.berg_margin_nm * 1.852) if berg_scn else None
     warnings = []
-    opt_path, n_opt = astar(env, start, goal, req, bergs, "optimal")
+    opt_path, n_opt, relaxed = _solve(env, start, goal, req, berg_scn)
     if opt_path is None:
-        warnings.append("No route satisfies POLARIS limits and iceberg clearances for this ice class; "
+        warnings.append("No route satisfies POLARIS limits for this ice class; "
                         "consider a higher ice class, icebreaker escort, or a later departure.")
     base_path, n_base = astar(env, start, goal, req, None, "shortest")
     step = berg_scn["step_h"] if berg_scn else 3
@@ -383,14 +409,17 @@ def plan(store, sic_slices, req: RouteRequest, berg_scn: dict | None) -> dict:
            "expanded": {"optimal": n_opt, "baseline": n_base}}
     berg_list = berg_scn["bergs"] if berg_scn else None
     out["optimal"] = evaluate(env, opt_path, req, berg_list, step) if opt_path else None
+    if out["optimal"]:
+        out["optimal"]["relaxed_clearance"] = relaxed
+        if relaxed:
+            warnings.append(_relaxed_warning(out["optimal"], req, "Recommended route"))
     out["baseline"] = evaluate(env, base_path, req, berg_list, step) if base_path else None
     out["alternatives"] = []
     for key, label, alt in alternative_profiles(req):
-        ab = BergField(berg_scn["bergs"], berg_scn["step_h"], alt.berg_margin_nm * 1.852) if berg_scn else None
-        path, _ = astar(env, start, goal, alt, ab, "optimal")
+        path, _, alt_relaxed = _solve(env, start, goal, alt, berg_scn)
         if path:
             ev = evaluate(env, path, alt, berg_list, step)
-            ev.update({"key": key, "label": label,
+            ev.update({"key": key, "label": label, "relaxed_clearance": alt_relaxed,
                        "same_track_as_optimal": bool(opt_path) and path == opt_path})
             out["alternatives"].append(ev)
     if out["optimal"] and out["baseline"]:

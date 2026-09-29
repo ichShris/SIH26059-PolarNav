@@ -247,6 +247,75 @@ class DriftEngine:
         return {"step_h": 3, "members": members, "bergs": bergs,
                 "summary": {"mean_err_72h_km": {"hybrid": float(np.mean(errs_h)), "physics": float(np.mean(errs_p))}}}
 
+    # ------------------------------------------------------------ live mode
+    def live_scenario(self, day: int, reported: list[dict], sic_fields: list[np.ndarray], height_m: float,
+                      members: int = 30) -> dict:
+        """Real icebergs (USNIC): dead-reckon from each report to the analysis time on analysed
+        winds, then a 72 h hybrid ensemble forecast. No verifying truth exists yet in live use."""
+        t0 = day * 24.0 + 12.0
+        keep = []
+        for r in reported:
+            x, y = to_xy(r["lat"], r["lon"])
+            if abs(x) < C.NAV_HALF_KM and abs(y) < C.NAV_HALF_KM:
+                keep.append((r, float(x), float(y)))
+        if not keep:
+            return {"step_h": 3, "members": members, "bergs": [], "mode": "live",
+                    "summary": {"mean_err_72h_km": {"hybrid": None, "physics": None}}}
+        sic_fn = self.sic_sampler(day, sic_fields)
+        ids = [r["name"] for r, _, _ in keep]
+        L = np.array([r["length_m"] for r, _, _ in keep])
+        W = np.array([max(r["width_m"], 0.3 * r["length_m"]) for r, _, _ in keep])
+        H = np.full(len(keep), height_m)
+        start = Bergs(ids, [x for _, x, _ in keep], [y for _, _, y in keep], L, W, H)
+        # dead reckoning since the report (the CSV carries one report time for all bergs)
+        rep_h = np.array([(r["reported"] - C.SIM_START).days * 24.0 + 12.0 for r, _, _ in keep])
+        gap_h = float(max(t0 - rep_h.min(), 0.0))
+        if gap_h >= 1.0:
+            past, _ = self.simulate(start, t0 - gap_h, gap_h, truth=False, issue_h=None, sic_fn=sic_fn,
+                                    hybrid=True, record_every_h=6)
+        else:
+            past = np.stack([np.stack([start.x, start.y], -1)])
+        now = Bergs(ids, past[-1, :, 0], past[-1, :, 1], L, W, H)
+        rng = np.random.default_rng(day)
+        ens = now.repeat(members)
+        # position uncertainty grows with the dead-reckoning interval (~1.5 km per day)
+        pos_sd = 0.5 + 1.5 * gap_h / 24.0
+        ens.x = ens.x + rng.normal(0, pos_sd, len(ens))
+        ens.y = ens.y + rng.normal(0, pos_sd, len(ens))
+        mem = np.tile(np.arange(members), len(now))
+        ca = MODEL_CA * np.exp(rng.normal(0, 0.2, len(ens)))
+        cw = MODEL_CW * np.exp(rng.normal(0, 0.2, len(ens)))
+        hyb, _ = self.simulate(ens, t0, 72, truth=False, issue_h=t0, members=mem, sic_fn=sic_fn,
+                               ca=ca, cw=cw, hybrid=True, record_every_h=3)
+        phys, _ = self.simulate(now, t0, 72, truth=False, issue_h=t0, sic_fn=sic_fn, record_every_h=3)
+        hyb = hyb.reshape(hyb.shape[0], len(now), members, 2)
+        mean = hyb.mean(2)
+        bergs = []
+        for b in range(len(now)):
+            ell = []
+            for k in range(0, hyb.shape[0], 2):
+                cov = np.cov(hyb[k, b].T) + np.eye(2) * 0.25
+                vals, vecs = np.linalg.eigh(cov)
+                ell.append({"t_h": 3 * k, "x": float(mean[k, b, 0]), "y": float(mean[k, b, 1]),
+                            "a": float(2.0 * np.sqrt(vals[1])), "b": float(2.0 * np.sqrt(vals[0])),
+                            "angle": float(np.degrees(np.arctan2(vecs[1, 1], vecs[0, 1])))})
+            lat, lon = to_latlon(now.x[b], now.y[b])
+            r0 = keep[b][0]
+            bergs.append({
+                "id": now.ids[b], "lat": float(lat), "lon": float(lon), "x": float(now.x[b]), "y": float(now.y[b]),
+                "length_m": float(L[b]), "width_m": float(W[b]), "height_m": float(H[b]),
+                "draft_m": float(H[b] * RHO_I / RHO_W),
+                "observed": np.round(past[:, b], 2).tolist(),
+                "forecast": np.round(mean[:, b], 2).tolist(),
+                "physics_only": np.round(phys[:, b], 2).tolist(),
+                "truth": [], "members_72h": np.round(hyb[-1, b], 1).tolist(), "ellipses": ell,
+                "error_72h_km": None, "grounded": False,
+                "reported": {"date": str(r0["reported"]), "lat": r0["lat"], "lon": r0["lon"]},
+                "dead_reckoned_km": float(np.hypot(*(past[-1, b] - past[0, b]))),
+            })
+        return {"step_h": 3, "members": members, "bergs": bergs, "mode": "live", "dead_reckoned_h": gap_h,
+                "summary": {"mean_err_72h_km": {"hybrid": None, "physics": None}}}
+
     # ------------------------------------------------------------ hybrid training
     def _windows(self, days: list[int], per_day: int, rng):
         """6 h physics hindcasts restarted from truth; returns features & residual velocities."""

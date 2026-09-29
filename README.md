@@ -54,6 +54,32 @@ On first start the service regenerates the 4-year environment dataset (`world_v1
 8. **Edge sync** tab — bundle size and transfer time per satellite link; tick *Simulate satellite-link blackout* and
    recompute: the dashboard keeps running from its cached bundle.
 
+## Live mode (real data)
+
+Switch **Simulation → ● Live** in the top bar. The same models then run on real, current data — no accounts or keys:
+
+| Input | Live source | Refresh |
+|---|---|---|
+| Sea-ice concentration | NSIDC Sea Ice Index G02135 v4, daily 25 km GeoTIFF (EPSG:3412), regridded to the 50 km model grid | daily (≈1 day latency) |
+| 10 m winds, past 12 days + 4-day forecast | ECMWF IFS 0.25° via Open-Meteo, sampled every 500 km | hourly |
+| Surface currents | Open-Meteo Marine API (ocean points); climatology fills gaps, e.g. under sea ice | 3-hourly |
+| Icebergs | US National Ice Center Antarctic iceberg list (CSV) | ~weekly |
+
+What happens with them: the ConvLSTM forecasts sea ice from the last 7 NSIDC days and the ECMWF winds; each USNIC
+iceberg is dead-reckoned from its report date to the analysis time on the real winds and currents, then forecast 72 h
+with the hybrid ensemble; POLARIS and the router run on the forecast fields. Downloads are cached in `backend/cache/live/`
+and the snapshot refreshes hourly (or *AI models → ↻ Refresh live data*). `GET /api/live/status` lists the sources.
+
+Still modelled in live mode: ice thickness (no free daily product — diagnostic from concentration), iceberg keel depth
+(USNIC gives length and width; 250 m thickness assumed) and wind ensemble spread (perturbations around the single
+ECMWF run). Forecast *error* for the future cannot be shown live; the real-time check (forecasts issued 1–3 days ago vs
+today's NSIDC analysis) can. On the first live snapshot (analysis 2026-09-28) the ConvLSTM — trained only on simulated
+data — beat persistence on real ice at every lead (RMSE 5.00 / 7.03 / 9.13 % vs 5.11 / 7.37 / 9.86 %). That is one
+day's verification with analysed rather than archived forecast winds, so treat it as encouraging, not proven.
+
+If a berg's exclusion zone closes the only approach to a station (e.g. D23 off Bharati in the September 2026 list), the
+router falls back to the least-bad passage and warns which berg it passes and how close.
+
 ## Architecture
 
 ```
@@ -105,8 +131,9 @@ In live use the ensemble spread (iceberg ellipses) is the forward-looking uncert
 
 ## Limitations — read before presenting
 
-* **All data is synthetic.** The prototype runs offline without Copernicus / ECMWF / NSIDC credentials, so every feed comes
-  from `synth.py`. The environment is physically structured (realistic seasonal extent, cyclone climatology, free-drift ice
+* **Simulation mode is synthetic; live mode uses real feeds but models trained on synthetic data.** The simulation runs
+  offline from `synth.py`; the scores in the table above are measured there, not on the real Southern Ocean. Live mode
+  (above) runs the same models on NSIDC / ECMWF / USNIC data but they have not been retrained on real history yet. The environment is physically structured (realistic seasonal extent, cyclone climatology, free-drift ice
   physics), but the scores above are scores *on that environment*, not on the real Southern Ocean. Real-world 72 h iceberg
   errors are typically larger (tens of km) and real SAR is harder (sea state, bergy bits, ships).
 * **The deck's ">15 % fuel reduction" is only reached in heavy early-season ice** in our benchmark; the honest season-wide

@@ -123,6 +123,7 @@ export default function VoyagePanel(p: Props) {
                     {r.ev.summary.fuel_t.toFixed(0)} t · {fmtH(r.ev.summary.hours)} · {r.ev.summary.distance_nm.toFixed(0)} nm
                   </span>
                   {r.sameAsOptimal && <span className="ro-note">same track as recommended</span>}
+                  {r.ev.relaxed_clearance && <span className="ro-note warn-note">⚠ reduced iceberg clearance</span>}
                 </button>
               </li>
             ))}

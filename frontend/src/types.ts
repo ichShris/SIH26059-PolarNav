@@ -51,11 +51,26 @@ export interface Berg {
   truth: [number, number][]
   members_72h: [number, number][]
   ellipses: Ellipse[]
-  error_72h_km: { hybrid: number; physics: number }
+  error_72h_km: { hybrid: number; physics: number } | null // null in live mode: no truth yet
   grounded: boolean
+  reported?: { date: string; lat: number; lon: number } // live: USNIC report the track starts from
+  dead_reckoned_km?: number
+}
+
+export type DataMode = 'sim' | 'live'
+
+export interface LiveSources {
+  sea_ice: { name: string; valid: string }
+  wind: { name: string; from: string; to: string }
+  currents: { name: string; points: number }
+  icebergs: { name: string; report: string; count: number }
+  modelled: string[]
+  fetched_at: string
 }
 
 export interface Scenario {
+  mode: DataMode
+  sources: LiveSources | null
   date: string
   day: number
   is_test_period: boolean
@@ -64,7 +79,13 @@ export interface Scenario {
   thickness: string[]
   extent_km2: number[]
   wind: { n: number; step_km: number; u: number[]; v: number[] }
-  bergs: { step_h: number; members: number; bergs: Berg[]; summary: { mean_err_72h_km: { hybrid: number; physics: number } } }
+  bergs: {
+    step_h: number
+    members: number
+    bergs: Berg[]
+    summary: { mean_err_72h_km: { hybrid: number | null; physics: number | null } }
+    dead_reckoned_h?: number
+  }
   skill: { lead_h: number; model: Skill; persistence: Skill }[]
   live_check: LiveCheck
 }
@@ -91,7 +112,8 @@ export interface RouteEval {
   points: RoutePoint[]
   waypoints: Waypoint[]
   summary: RouteSummary
-  berg_clearance: { id: string; cpa_km: number; t_h: number; cpa_truth_km: number }[]
+  berg_clearance: { id: string; cpa_km: number; t_h: number; cpa_truth_km: number | null }[]
+  relaxed_clearance?: boolean // no track kept the full iceberg clearance; least-bad passage flagged
 }
 
 export interface SyncStats {
@@ -108,6 +130,7 @@ export interface LiveCheck {
   per_lead: { lead_h: number; issued: string; model: Skill; persistence: Skill }[]
   error_24h: string | null
   reference: string
+  note?: string | null
 }
 
 export interface RoutePlan {

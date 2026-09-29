@@ -243,6 +243,14 @@ table.wp tbody tr:hover { background: var(--panel-2); }
 .globe-ctrl button { background: rgba(9, 24, 40, 0.9); font-size: 12px; padding: 5px 10px; }
 .globe-ctrl button.on { color: var(--accent); border-color: var(--accent); }
 .globe-hint { position: absolute; right: 14px; bottom: 46px; pointer-events: none; }
+.mode-seg button { padding: 4px 11px; font-size: 12px; white-space: nowrap; }
+.mode-seg button.on { background: rgba(62, 194, 143, 0.16); color: var(--good); }
+.pill.live { color: var(--good); border-color: rgba(62, 194, 143, 0.5); background: rgba(62, 194, 143, 0.08); }
+.sources { background: var(--panel-2); border-radius: 8px; padding: 10px 12px; margin-bottom: 14px; }
+.sources h3 { margin-top: 0; }
+.sources ul { margin: 6px 0; padding-left: 16px; font-size: 12px; display: grid; gap: 3px; color: var(--ink-2); }
+.sources b { color: var(--ink); }
+.warn-note { color: var(--warn) !important; font-style: normal !important; }
 .view-seg button.on { background: rgba(255, 209, 102, 0.16); color: #ffd166; }
 
 /* ---------------------------------------------------------------- right panel */

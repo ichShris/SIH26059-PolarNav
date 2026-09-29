@@ -1,4 +1,9 @@
-"""PolarNav HTTP API (FastAPI). Also serves the built dashboard from frontend/dist."""
+"""PolarNav HTTP API (FastAPI). Also serves the built dashboard from frontend/dist.
+
+Every data endpoint takes ``mode``: ``sim`` (the synthetic twin, any date 2022-2025, with a
+verifying truth) or ``live`` (latest NSIDC sea ice, ECMWF winds, Open-Meteo currents and
+USNIC icebergs; no future truth exists yet).
+"""
 from __future__ import annotations
 
 import base64
@@ -19,9 +24,10 @@ from . import config as C
 from . import edge_sync, geo, polaris, routing, sar
 from .data import get_store
 from .drift import METRICS_FILE as DRIFT_METRICS, DriftEngine
+from .live import BERG_HEIGHT_M, get_live
 from .sic_model import Forecaster, skill
 
-app = FastAPI(title="PolarNav API", version="0.1.0",
+app = FastAPI(title="PolarNav API", version="0.2.0",
               description="AI-enabled Antarctic sea-ice, iceberg trajectory and navigation decision support")
 app.add_middleware(GZipMiddleware, minimum_size=2000)
 
@@ -39,6 +45,36 @@ def svc() -> dict:
         return _svc
 
 
+class Ctx:
+    """One data world: the synthetic twin ('sim') or a live snapshot ('live:<fetch time>')."""
+
+    def __init__(self, key: str, store, fc, drift, live: bool):
+        self.key, self.store, self.fc, self.drift, self.live = key, store, fc, drift, live
+
+
+_ctx: dict[str, Ctx] = {}
+_ctx_lock = threading.Lock()
+
+
+def ctx(mode: str = "sim", refresh: bool = False) -> Ctx:
+    if mode not in ("sim", "live"):
+        raise HTTPException(400, "mode must be 'sim' or 'live'")
+    s = svc()
+    if mode == "sim":
+        return _ctx.setdefault("sim", Ctx("sim", s["store"], s["fc"], s["drift"], False))
+    try:
+        ls = get_live(s["store"], refresh=refresh)
+    except Exception as e:
+        raise HTTPException(503, f"live data sources unreachable: {e}")
+    key = f"live:{ls.fetched_at}"
+    with _ctx_lock:
+        if key not in _ctx:
+            for k in [k for k in _ctx if k.startswith("live:")]:
+                del _ctx[k]  # drop the previous live snapshot
+            _ctx[key] = Ctx(key, ls, Forecaster(ls), DriftEngine(ls), True)
+        return _ctx[key]
+
+
 def b64(a: np.ndarray) -> str:
     return base64.b64encode(np.ascontiguousarray(a).tobytes()).decode()
 
@@ -47,79 +83,83 @@ def q_sic(a: np.ndarray) -> str:
     return b64(np.round(np.clip(a, 0, 1) * 100).astype(np.uint8))
 
 
-def parse_day(date: str | None) -> int:
-    s = svc()["store"]
+def parse_day(date: str | None, c: Ctx) -> int:
+    if c.live:
+        return c.store.day0  # live mode always runs from the latest satellite analysis
     d = C.DEFAULT_DATE if not date else dt.date.fromisoformat(date)
     day = C.day_index(d)
-    lo, hi = C.HISTORY_DAYS - 1, s.n_days - 1 - C.FORECAST_DAYS
+    lo, hi = C.HISTORY_DAYS - 1, c.store.n_days - 1 - C.FORECAST_DAYS
     if not lo <= day <= hi:
         raise HTTPException(400, f"date must be between {C.index_day(lo)} and {C.index_day(hi)}")
     return day
 
 
-# ------------------------------------------------------------------ cached computations
+# ------------------------------------------------------------------ cached computations (keyed by data world)
 @lru_cache(maxsize=1)
 def sar_benchmark():
     return sar.benchmark(20)
 
 
+@lru_cache(maxsize=24)
+def sic_bundle(key: str, day: int):
+    c = _ctx[key]
+    return [c.store.sic_obs(day)] + list(c.fc.forecast(day))
+
+
 @lru_cache(maxsize=12)
-def sic_bundle(day: int):
-    s = svc()
-    analysis = s["store"].sic_obs(day)
-    fc = s["fc"].forecast(day)
-    return [analysis] + list(fc)
+def berg_scenario(key: str, day: int) -> dict:
+    c = _ctx[key]
+    if c.live:
+        return c.drift.live_scenario(day, c.store.icebergs["bergs"], sic_bundle(key, day), BERG_HEIGHT_M)
+    return c.drift.scenario(day, np.stack(sic_bundle(key, day)[1:]))
 
 
-@lru_cache(maxsize=8)
-def berg_scenario(day: int) -> dict:
-    return svc()["drift"].scenario(day, np.stack(sic_bundle(day)[1:]))
-
-
-@lru_cache(maxsize=32)
-def cached_plan(day, o_lat, o_lon, d_lat, d_lon, ice_class, cruise_kn, w_time, w_risk, avoid_bergs, w_ice, berg_margin_nm):
+@lru_cache(maxsize=48)
+def cached_plan(key, day, o_lat, o_lon, d_lat, d_lon, ice_class, cruise_kn, w_time, w_risk, avoid_bergs, w_ice,
+                berg_margin_nm):
     req = routing.RouteRequest(day=day, origin=(o_lat, o_lon), dest=(d_lat, d_lon), ice_class=ice_class,
                                cruise_kn=cruise_kn, w_time=w_time, w_risk=w_risk, avoid_bergs=avoid_bergs,
                                w_ice=w_ice, berg_margin_nm=berg_margin_nm)
     t0 = time.time()
-    out = routing.plan(svc()["store"], sic_bundle(day), req, berg_scenario(day))
+    out = routing.plan(_ctx[key].store, sic_bundle(key, day), req, berg_scenario(key, day))
     out["compute_s"] = round(time.time() - t0, 2)
     return out
 
 
-def live_check(day: int) -> dict:
+def live_check(c: Ctx, day: int) -> dict:
     """Verification that is possible in real time: earlier forecasts valid *today* vs today's analysis.
 
     The forecast issued k days ago for today (+24k h) is compared with today's satellite
     analysis. Unlike the hindcast error layer (forecast vs future truth), this needs no
     information from the future, so it runs every day on the ship or ashore.
     """
-    analysis = sic_bundle(day)[0]
-    ocean = ~svc()["store"].ice_blocked
+    analysis = sic_bundle(c.key, day)[0]
+    ocean = ~c.store.ice_blocked
     rows, err24 = [], None
     for k in range(1, C.FORECAST_DAYS + 1):
         issue = day - k
         if issue < C.HISTORY_DAYS - 1:
             continue
-        fc = sic_bundle(issue)[k]
-        pers = sic_bundle(issue)[0]
+        fc = sic_bundle(c.key, issue)[k]
+        pers = sic_bundle(c.key, issue)[0]
         rows.append({"lead_h": 24 * k, "issued": str(C.index_day(issue)),
                      "model": skill(fc, analysis, ocean), "persistence": skill(pers, analysis, ocean)})
         if k == 1:
             err24 = np.clip(np.round((fc - analysis) * 100), -127, 127).astype(np.int8)
+    note = ("Past issue days use the analysed winds (archived forecasts are not fetched), which slightly "
+            "flatters the model." if c.live else None)
     return {"per_lead": rows, "error_24h": b64(err24) if err24 is not None else None,
-            "reference": "today's satellite analysis"}
+            "reference": "today's satellite analysis", "note": note}
 
 
-def rio_slices(day: int, ice_class: str):
-    st = svc()["store"]
-    return [polaris.rio(f, st.thickness(f, day + k), ice_class) for k, f in enumerate(sic_bundle(day))]
+def rio_slices(c: Ctx, day: int, ice_class: str):
+    return [polaris.rio(f, c.store.thickness(f, day + k), ice_class) for k, f in enumerate(sic_bundle(c.key, day))]
 
 
-def sync_bundle(day: int, ice_class: str, plan: dict):
+def sync_bundle(c: Ctx, day: int, ice_class: str, plan: dict):
     wps = plan["optimal"]["waypoints"] if plan.get("optimal") else []
-    return edge_sync.pack(str(C.index_day(day)), ice_class, sic_bundle(day), rio_slices(day, ice_class),
-                          berg_scenario(day)["bergs"], wps)
+    return edge_sync.pack(str(C.index_day(day)), ice_class, sic_bundle(c.key, day), rio_slices(c, day, ice_class),
+                          berg_scenario(c.key, day)["bergs"], wps)
 
 
 # ------------------------------------------------------------------ endpoints
@@ -150,6 +190,7 @@ def meta():
         "metrics": {"sic": s["fc"].metrics, "drift": drift_m, "routes": bench,
                     "sar": sar_benchmark()},
         "data_mode": "synthetic-digital-twin",
+        "modes": ["sim", "live"],
     }
 
 
@@ -165,20 +206,22 @@ def coastline_globe():
 
 
 @app.get("/api/scenario")
-def scenario(date: str | None = None):
-    day = parse_day(date)
-    s = svc()
-    store = s["store"]
-    sics = sic_bundle(day)
+def scenario(date: str | None = None, mode: str = "sim"):
+    c = ctx(mode)
+    day = parse_day(date, c)
+    store = c.store
+    sics = sic_bundle(c.key, day)
     thick = [store.thickness(f, day + k) for k, f in enumerate(sics)]
-    truth = [store.sic_truth(day + 1 + k) for k in range(C.FORECAST_DAYS)]
+    # a verifying truth for the forecast days only exists in hindcast (simulation) mode
+    truth = [] if c.live else [store.sic_truth(day + 1 + k) for k in range(C.FORECAST_DAYS)]
     w = store.wind_truth(day)[:, ::2, ::2]  # 200 km arrows
-    bergs = berg_scenario(day)
+    bergs = berg_scenario(c.key, day)
     area = lambda f: float((f > 0.15).sum() * C.CELL_KM ** 2)
     return {
+        "mode": "live" if c.live else "sim",
         "date": str(C.index_day(day)),
         "day": day,
-        "is_test_period": C.index_day(day) > C.VAL_END,
+        "is_test_period": (not c.live) and C.index_day(day) > C.VAL_END,
         "sic": [q_sic(f) for f in sics],
         "sic_truth": [q_sic(f) for f in truth],
         "thickness": [b64(np.round(np.clip(h, 0, 5.1) * 50).astype(np.uint8)) for h in thick],
@@ -186,17 +229,25 @@ def scenario(date: str | None = None):
         "wind": {"n": int(w.shape[1]), "step_km": C.CELL_KM * 4, "u": np.round(w[0], 1).ravel().tolist(),
                  "v": np.round(w[1], 1).ravel().tolist()},
         "bergs": bergs,
-        "skill": s["fc"].daily_skill(day, np.stack(sics[1:])),
-        "live_check": live_check(day),
+        "skill": [] if c.live else c.fc.daily_skill(day, np.stack(sics[1:])),
+        "live_check": live_check(c, day),
+        "sources": store.sources() if c.live else None,
     }
 
 
+@app.get("/api/live/status")
+def live_status(refresh: bool = False):
+    """Fetch (or reuse, at most 1 h old) the live feeds and report what they contain."""
+    return ctx("live", refresh=refresh).store.sources()
+
+
 @app.get("/api/polaris")
-def polaris_grid(date: str | None = None, ice_class: str = "PC5"):
+def polaris_grid(date: str | None = None, ice_class: str = "PC5", mode: str = "sim"):
     if ice_class not in C.ICE_CLASSES:
         raise HTTPException(400, "unknown ice class")
-    day = parse_day(date)
-    rs = rio_slices(day, ice_class)
+    c = ctx(mode)
+    day = parse_day(date, c)
+    rs = rio_slices(c, day, ice_class)
     return {"ice_class": ice_class, "rio": [b64(np.clip(np.round(r), -127, 127).astype(np.int8)) for r in rs],
             "level": [b64(polaris.operation_level(r, ice_class).astype(np.uint8)) for r in rs]}
 
@@ -217,30 +268,32 @@ class RouteBody(BaseModel):
     avoid_bergs: bool = True
     w_ice: float = Field(0.0, ge=0, le=2)
     berg_margin_nm: float = Field(5.0, ge=1, le=30)
+    mode: str = "sim"
 
 
 def _plan(body: RouteBody):
     if body.ice_class not in C.ICE_CLASSES:
         raise HTTPException(400, "unknown ice class")
-    day = parse_day(body.date)
-    return day, cached_plan(day, round(body.origin.lat, 3), round(body.origin.lon, 3), round(body.dest.lat, 3),
-                            round(body.dest.lon, 3), body.ice_class, body.cruise_kn, body.w_time, body.w_risk,
-                            body.avoid_bergs, body.w_ice, body.berg_margin_nm)
+    c = ctx(body.mode)
+    day = parse_day(body.date, c)
+    return c, day, cached_plan(c.key, day, round(body.origin.lat, 3), round(body.origin.lon, 3),
+                               round(body.dest.lat, 3), round(body.dest.lon, 3), body.ice_class, body.cruise_kn,
+                               body.w_time, body.w_risk, body.avoid_bergs, body.w_ice, body.berg_margin_nm)
 
 
 @app.post("/api/route")
 def route(body: RouteBody):
-    day, plan = _plan(body)
+    c, day, plan = _plan(body)
     out = dict(plan)
-    _, stats = sync_bundle(day, body.ice_class, plan)
+    _, stats = sync_bundle(c, day, body.ice_class, plan)
     out["sync"] = stats
     return out
 
 
 @app.post("/api/sync/bundle")
 def bundle(body: RouteBody):
-    day, plan = _plan(body)
-    data, _ = sync_bundle(day, body.ice_class, plan)
+    c, day, plan = _plan(body)
+    data, _ = sync_bundle(c, day, body.ice_class, plan)
     return Response(data, media_type="application/octet-stream",
                     headers={"Content-Disposition": f'attachment; filename="polarnav_{C.index_day(day)}.pnb"'})
 

@@ -33,7 +33,8 @@ export function cellColor(d: Decoded, layer: RasterLayer, slot: number, i: numbe
   if (layer === 'sic') c = sicColor(d.sic[s][i])
   else if (layer === 'thickness') c = thickColor(d.thick[s][i] / 50)
   else if (layer === 'polaris') c = d.rio && d.level ? rioColor(d.rio[s][i], d.level[s][i], d.sic[s][i] > 2) : [0, 0, 0, 0]
-  else if (layer === 'error') c = s > 0 ? diffColor(d.sic[s][i] - d.truth[s - 1][i]) : d.live24 ? diffColor(d.live24[i]) : [0, 0, 0, 0]
+  else if (layer === 'error')
+    c = s > 0 ? (d.truth[s - 1] ? diffColor(d.sic[s][i] - d.truth[s - 1][i]) : [0, 0, 0, 0]) : d.live24 ? diffColor(d.live24[i]) : [0, 0, 0, 0]
   else return null
   return c[3] < 8 ? null : c
 }

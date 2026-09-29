@@ -18,22 +18,35 @@ export function HazardsPanel({ scenario, plan, selected, onSelect }: {
     return ca !== cb ? ca - cb : b.length_m - a.length_m
   })
   const s = scenario.bergs.summary.mean_err_72h_km
+  const live = scenario.mode === 'live'
+  const rep = live ? scenario.sources?.icebergs.report : null
   return (
     <div>
-      <p className="muted small">
-        {bergs.length} icebergs tracked from SAR. 72 h forecasts: {scenario.bergs.members}-member ensemble (forecast-wind members, drag
-        perturbations, SAR geolocation error) with hybrid physics-AI drift. Ellipses are 2σ.
-      </p>
-      <div className="stat-row">
-        <div className="stat">
-          <div className="stat-num">{s.hybrid.toFixed(1)} km</div>
-          <div className="muted small">hybrid 72 h error today</div>
+      {live ? (
+        <p className="muted small">
+          {bergs.length} real icebergs from the US National Ice Center (report {rep}). Each is carried forward{' '}
+          {Math.round(scenario.bergs.dead_reckoned_h ?? 0)} h to the sea-ice analysis time on ECMWF winds and live currents
+          (dead reckoning), then forecast 72 h with a {scenario.bergs.members}-member hybrid ensemble. Ellipses are 2σ. No
+          verifying truth exists yet.
+        </p>
+      ) : (
+        <p className="muted small">
+          {bergs.length} icebergs tracked from SAR. 72 h forecasts: {scenario.bergs.members}-member ensemble (forecast-wind members,
+          drag perturbations, SAR geolocation error) with hybrid physics-AI drift. Ellipses are 2σ.
+        </p>
+      )}
+      {s.hybrid !== null && s.physics !== null && (
+        <div className="stat-row">
+          <div className="stat">
+            <div className="stat-num">{s.hybrid.toFixed(1)} km</div>
+            <div className="muted small">hybrid 72 h error today</div>
+          </div>
+          <div className="stat">
+            <div className="stat-num">{s.physics.toFixed(1)} km</div>
+            <div className="muted small">physics-only</div>
+          </div>
         </div>
-        <div className="stat">
-          <div className="stat-num">{s.physics.toFixed(1)} km</div>
-          <div className="muted small">physics-only</div>
-        </div>
-      </div>
+      )}
       <ul className="berg-list">
         {bergs.map((b) => {
           const c = clearance.get(b.id)
@@ -55,11 +68,17 @@ export function HazardsPanel({ scenario, plan, selected, onSelect }: {
                 {(b.length_m / 1000).toFixed(1)} × {(b.width_m / 1000).toFixed(1)} km · draft {b.draft_m.toFixed(0)} m · drift {kn.toFixed(2)} kn
                 {b.grounded ? ' · grounded' : ''}
               </div>
-              {b.id === selected && (
+              {b.id === selected && b.reported && (
+                <div className="small muted">
+                  Reported {b.reported.date} at {b.reported.lat.toFixed(2)}°, {b.reported.lon.toFixed(2)}° · dead-reckoned{' '}
+                  {(b.dead_reckoned_km ?? 0).toFixed(1)} km since · keel depth assumed ({b.draft_m.toFixed(0)} m)
+                </div>
+              )}
+              {b.id === selected && b.error_72h_km && (
                 <div className="small verify">
                   Verification (truth known in hindcast): 72 h error hybrid <b>{b.error_72h_km.hybrid.toFixed(1)} km</b>, physics-only{' '}
                   <b>{b.error_72h_km.physics.toFixed(1)} km</b>
-                  {c ? <>; true CPA to route {(c.cpa_truth_km / 1.852).toFixed(1)} nm</> : null}
+                  {c && c.cpa_truth_km !== null ? <>; true CPA to route {(c.cpa_truth_km / 1.852).toFixed(1)} nm</> : null}
                 </div>
               )}
             </li>
@@ -71,12 +90,44 @@ export function HazardsPanel({ scenario, plan, selected, onSelect }: {
 }
 
 // ------------------------------------------------------------------ AI models
-export function ModelsPanel({ meta, scenario }: { meta: Meta; scenario: Scenario | null }) {
+export function ModelsPanel({ meta, scenario, onRefreshLive, refreshing }: {
+  meta: Meta
+  scenario: Scenario | null
+  onRefreshLive: () => void
+  refreshing: boolean
+}) {
   const m = meta.metrics.sic
   const d = meta.metrics.drift
   const leads = ['+24h', '+48h', '+72h']
+  const src = scenario?.mode === 'live' ? scenario.sources : null
   return (
     <div>
+      {src && (
+        <div className="sources">
+          <h3>Live data sources</h3>
+          <ul>
+            <li>
+              <b>Sea ice</b> {src.sea_ice.name} · valid {src.sea_ice.valid}
+            </li>
+            <li>
+              <b>Wind</b> {src.wind.name} · {src.wind.from.replace('T', ' ')} → {src.wind.to.replace('T', ' ')} UTC
+            </li>
+            <li>
+              <b>Currents</b> {src.currents.name} · {src.currents.points} live points
+            </li>
+            <li>
+              <b>Icebergs</b> {src.icebergs.name} · {src.icebergs.count} bergs, report {src.icebergs.report}
+            </li>
+          </ul>
+          <p className="muted small">Still modelled: {src.modelled.join('; ')}.</p>
+          <div className="row gap">
+            <button onClick={onRefreshLive} disabled={refreshing}>
+              {refreshing ? 'Refreshing…' : '↻ Refresh live data'}
+            </button>
+            <span className="muted small">fetched {src.fetched_at.replace('T', ' ').slice(0, 16)} UTC · auto-refresh hourly</span>
+          </div>
+        </div>
+      )}
       <h3>Sea-ice concentration · ConvLSTM</h3>
       {m ? (
         <>
@@ -113,6 +164,7 @@ export function ModelsPanel({ meta, scenario }: { meta: Meta; scenario: Scenario
           <h3>Real-time forecast check</h3>
           <p className="muted small">
             Works live: forecasts issued 1–3 days ago that are valid today, scored against today's satellite analysis. No future data needed.
+            {scenario.live_check.note ? ` ${scenario.live_check.note}` : ''}
           </p>
           <table className="cmp">
             <thead>

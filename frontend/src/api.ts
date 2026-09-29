@@ -1,7 +1,7 @@
 // API client with an offline-first cache: every successful response is kept in
 // localStorage, and when the shore link is down the dashboard runs from the last
 // synced bundle.
-import type { Coastline, GlobeLand, Meta, PolarisGrid, RoutePlan, SarResult, Scenario } from './types'
+import type { Coastline, DataMode, GlobeLand, LiveSources, Meta, PolarisGrid, RoutePlan, SarResult, Scenario } from './types'
 
 const PREFIX = 'polarnav:'
 
@@ -61,11 +61,16 @@ export const api = {
   meta: () => cached<Meta>('meta', '/api/meta'),
   coastline: () => cached<Coastline>('coastline', '/api/coastline'),
   globeLand: () => cached<GlobeLand>('globe', '/api/coastline/globe'),
-  scenario: (date: string) => cached<Scenario>(`scenario:last`, `/api/scenario?date=${date}`),
-  polaris: (date: string, iceClass: string) =>
-    cached<PolarisGrid>(`polaris:last`, `/api/polaris?date=${date}&ice_class=${encodeURIComponent(iceClass)}`),
-  route: (body: object) =>
-    cached<RoutePlan>('route:last', '/api/route', {
+  scenario: (date: string, mode: DataMode) => cached<Scenario>(`scenario:${mode}`, `/api/scenario?date=${date}&mode=${mode}`),
+  polaris: (date: string, iceClass: string, mode: DataMode) =>
+    cached<PolarisGrid>(`polaris:${mode}`, `/api/polaris?date=${date}&ice_class=${encodeURIComponent(iceClass)}&mode=${mode}`),
+  liveStatus: async (refresh: boolean) => {
+    const r = await fetch(`/api/live/status?refresh=${refresh}`)
+    if (!r.ok) throw new ApiError((await r.json().catch(() => ({}))).detail ?? 'live status failed', r.status)
+    return (await r.json()) as LiveSources
+  },
+  route: (body: { mode?: DataMode }) =>
+    cached<RoutePlan>(`route:${body.mode ?? 'sim'}`, '/api/route', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),

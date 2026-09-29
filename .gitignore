@@ -7,3 +7,4 @@ frontend/dist/
 # regenerated on first run (~3 min); model weights and metrics ARE committed
 backend/artifacts/world_*.npz
 *.log
+backend/cache/

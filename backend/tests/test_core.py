@@ -129,3 +129,22 @@ def test_land_mask_and_places():
     assert not m["blocked"][j, i]
     frac = m["antarctica"].sum() * C.CELL_KM ** 2 / 1e6
     assert 12 < frac < 16.5  # Antarctica incl. ice shelves ~14 M km^2 (projected area)
+
+
+# ------------------------------------------------------------------ live data plumbing (no network)
+def test_nsidc_projection_matches_published_grid_corners():
+    from polarnav.live import nsidc_xy
+    # NSIDC 25 km south grid outer corners (EPSG:3412)
+    for lat, lon, (ex, ey) in ((-39.23, 317.76, (-3950, 4350)), (-41.45, 135.0, (3950, -3950))):
+        x, y = nsidc_xy(lat, lon)
+        assert abs(x - ex) < 1.0 and abs(y - ey) < 1.0
+
+
+def test_regrid_reads_concentration_and_ignores_flags():
+    from polarnav.live import _Regrid
+    raw = np.full((332, 316), 1000, dtype=np.uint16)  # 100 % everywhere ...
+    raw[:, :158] = 2540                                # ... except flagged land on the western half
+    out = _Regrid()(raw)
+    assert out.shape == (C.ICE_N, C.ICE_N)
+    assert out.max() == pytest.approx(1.0)
+    assert out[:, : C.ICE_N // 2 - 2].max() == 0.0     # flags never become ice

@@ -15,7 +15,7 @@ import json
 import numpy as np
 
 from polarnav import config as C
-from polarnav.api import berg_scenario, sic_bundle, svc
+from polarnav.api import berg_scenario, ctx, sic_bundle
 from polarnav.routing import RouteRequest, plan
 
 LEGS = {
@@ -40,12 +40,13 @@ def main() -> None:
     ap.add_argument("--ice-class", default="PC5")
     ap.add_argument("--step", type=int, default=4)
     args = ap.parse_args()
-    store = svc()["store"]
+    c = ctx("sim")
+    store, key = c.store, c.key
     rows = []
     for day in season_days(args.step):
         for leg, (o, d) in LEGS.items():
             req = RouteRequest(day=day, origin=o, dest=d, ice_class=args.ice_class)
-            p = plan(store, sic_bundle(day), req, berg_scenario(day))
+            p = plan(store, sic_bundle(key, day), req, berg_scenario(key, day))
             if not (p["optimal"] and p["baseline"]):
                 rows.append({"date": str(C.index_day(day)), "leg": leg, "feasible": False})
                 continue

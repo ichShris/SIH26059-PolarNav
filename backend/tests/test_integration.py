@@ -17,12 +17,13 @@ pytestmark = pytest.mark.skipif(not (WORLD_FILE.exists() and MODEL_FILE.exists()
 
 @pytest.fixture(scope="module")
 def plan():
-    from polarnav.api import berg_scenario, sic_bundle, svc
+    from polarnav.api import berg_scenario, ctx, sic_bundle
     from polarnav.routing import RouteRequest
     from polarnav.routing import plan as make_plan
     day = C.day_index(C.DEFAULT_DATE)
     req = RouteRequest(day=day, origin=(-58.0, 14.0), dest=(-69.9, 11.75), ice_class="PC5")
-    return make_plan(svc()["store"], sic_bundle(day), req, berg_scenario(day)), berg_scenario(day), svc()["store"]
+    c = ctx("sim")
+    return make_plan(c.store, sic_bundle(c.key, day), req, berg_scenario(c.key, day)), berg_scenario(c.key, day), c.store
 
 
 def test_routes_stay_off_land(plan):

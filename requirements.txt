@@ -5,6 +5,7 @@ torch>=2.3
 fastapi>=0.115
 uvicorn[standard]>=0.30
 pydantic>=2.7
+tifffile>=2024.1  # reads the NSIDC GeoTIFFs in live mode
 # tests
 pytest>=8
 httpx>=0.27

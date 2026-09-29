@@ -6,7 +6,7 @@ import MapView, { type Overlays, type RasterLayer } from './components/MapView'
 import { HazardsPanel, ModelsPanel, SarPanel, SyncPanel } from './components/RightPanels'
 import VoyagePanel from './components/VoyagePanel'
 import { activeOption, routeOptions } from './routes'
-import type { Coastline, GlobeLand, Meta, PolarisGrid, RouteForm, RoutePlan, Scenario } from './types'
+import type { Coastline, DataMode, GlobeLand, Meta, PolarisGrid, RouteForm, RoutePlan, Scenario } from './types'
 
 type Tab = 'hazards' | 'models' | 'sar' | 'sync'
 
@@ -24,6 +24,9 @@ export default function App() {
   const [globeLand, setGlobeLand] = useState<GlobeLand | null>(null)
   const [view, setView] = useState<'chart' | 'globe'>('globe')
   const [date, setDate] = useState<string>('')
+  const [mode, setMode] = useState<DataMode>('sim')
+  const [refreshing, setRefreshing] = useState(false)
+  const [liveTick, setLiveTick] = useState(0)
   const [iceClass, setIceClass] = useState('PC5')
   const [scenario, setScenario] = useState<Scenario | null>(null)
   const [polaris, setPolaris] = useState<PolarisGrid | null>(null)
@@ -75,7 +78,7 @@ export default function App() {
     let live = true
     setLoading(true)
     api
-      .scenario(date)
+      .scenario(date, mode)
       .then((r) => {
         if (!live) return
         setScenario(r.data)
@@ -87,12 +90,24 @@ export default function App() {
     return () => {
       live = false
     }
-  }, [date, note])
+  }, [date, mode, liveTick, note])
 
   useEffect(() => {
     if (!date) return
-    api.polaris(date, iceClass).then((r) => setPolaris(r.data)).catch(() => setPolaris(null))
-  }, [date, iceClass])
+    api.polaris(date, iceClass, mode).then((r) => setPolaris(r.data)).catch(() => setPolaris(null))
+  }, [date, iceClass, mode, liveTick])
+
+  const refreshLive = async () => {
+    setRefreshing(true)
+    try {
+      await api.liveStatus(true)
+      setLiveTick((t) => t + 1)
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e))
+    } finally {
+      setRefreshing(false)
+    }
+  }
 
   const routeBody = useMemo(() => {
     if (!meta) return null
@@ -100,6 +115,8 @@ export default function App() {
       k === 'custom' && custom ? custom : { lat: meta.places[k].lat, lon: meta.places[k].lon }
     return {
       date,
+      mode,
+      live_tick: liveTick,
       origin: ll(form.origin, form.originLL),
       dest: ll(form.dest, form.destLL),
       ice_class: iceClass,
@@ -110,7 +127,7 @@ export default function App() {
       w_ice: form.w_ice,
       berg_margin_nm: form.berg_margin_nm,
     }
-  }, [meta, date, form, iceClass])
+  }, [meta, date, mode, liveTick, form, iceClass])
   const bodyKey = useMemo(() => JSON.stringify(routeBody), [routeBody])
 
   const compute = useCallback(() => {
@@ -133,11 +150,12 @@ export default function App() {
 
   // re-plan automatically (debounced) whenever the voyage settings, date or ice class change
   useEffect(() => {
-    if (!routeBody || scenario?.date !== date || bodyKey === planKey) return
+    const ready = scenario && scenario.mode === mode && (mode === 'live' || scenario.date === date)
+    if (!routeBody || !ready || bodyKey === planKey) return
     const id = setTimeout(compute, 450)
     return () => clearTimeout(id)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [bodyKey, scenario?.date])
+  }, [bodyKey, scenario?.date, scenario?.mode])
 
   const active = activeOption(plan, activeRoute)
   const maxT = Math.max(72, Math.ceil(active?.ev.summary.hours ?? 0))
@@ -195,10 +213,23 @@ export default function App() {
           </div>
         </div>
         <div className="top-controls">
-          <label>
-            Scenario date
-            <input type="date" value={date} min={meta.dates.min} max={meta.dates.max} onChange={(e) => e.target.value && setDate(e.target.value)} />
-          </label>
+          <div className="seg mode-seg" role="radiogroup" aria-label="Data source">
+            {(['sim', 'live'] as const).map((m) => (
+              <button key={m} role="radio" aria-checked={mode === m} className={mode === m ? 'on' : ''} onClick={() => setMode(m)}>
+                {m === 'sim' ? 'Simulation' : '● Live'}
+              </button>
+            ))}
+          </div>
+          {mode === 'sim' ? (
+            <label>
+              Scenario date
+              <input type="date" value={date} min={meta.dates.min} max={meta.dates.max} onChange={(e) => e.target.value && setDate(e.target.value)} />
+            </label>
+          ) : (
+            <span className="pill live" title={scenario?.sources ? `Fetched ${scenario.sources.fetched_at}` : ''}>
+              Sea ice {scenario?.mode === 'live' ? scenario.date : '…'} · ECMWF winds · USNIC bergs
+            </span>
+          )}
           <label>
             Ice class
             <select value={iceClass} onChange={(e) => setIceClass(e.target.value)}>
@@ -210,8 +241,12 @@ export default function App() {
             </select>
           </label>
           <span className={`pill ${offline ? 'down' : 'up'}`}>{offline ? '● OFFLINE · cached' : '● LINK UP'}</span>
-          {scenario?.is_test_period && <span className="pill info" title="Hindcast on the held-out test year: forecasts can be verified against truth">Hindcast · verifiable</span>}
-          <span className="pill info" title="Data source">Synthetic digital twin</span>
+          {mode === 'sim' && scenario?.is_test_period && (
+            <span className="pill info" title="Hindcast on the held-out test year: forecasts can be verified against truth">
+              Hindcast · verifiable
+            </span>
+          )}
+          {mode === 'sim' && <span className="pill info" title="Data source">Synthetic digital twin</span>}
           <span className="clock mono">{now.toISOString().slice(11, 19)} UTC</span>
         </div>
       </header>
@@ -313,8 +348,8 @@ export default function App() {
             ))}
           </div>
         </div>
-        <Legend layer={layer} verify={overlays.verify} slot={slot} plan={plan} />
-        {loading && <div className="loading">Running models for {date}…</div>}
+        <Legend layer={layer} verify={overlays.verify} slot={slot} plan={plan} live={mode === 'live'} />
+        {loading && <div className="loading">{mode === 'live' ? 'Fetching live satellite, weather and iceberg data…' : `Running models for ${date}…`}</div>}
         {error && (
           <div className="error-toast" role="alert" onClick={() => setError(null)}>
             {error}
@@ -364,7 +399,7 @@ export default function App() {
         </nav>
         <div className="tab-body">
           {tab === 'hazards' && <HazardsPanel scenario={scenario} plan={plan} selected={selectedBerg} onSelect={selectBerg} />}
-          {tab === 'models' && <ModelsPanel meta={meta} scenario={scenario} />}
+          {tab === 'models' && <ModelsPanel meta={meta} scenario={scenario} onRefreshLive={refreshLive} refreshing={refreshing} />}
           {tab === 'sar' && <SarPanel />}
           {tab === 'sync' && (
             <SyncPanel plan={plan} offline={offline} savedAt={savedAt} forceOffline={forceOffline} setForceOffline={toggleOffline} onDownload={download} />
@@ -375,7 +410,7 @@ export default function App() {
   )
 }
 
-function Legend({ layer, verify, slot, plan }: { layer: RasterLayer; verify: boolean; slot: number; plan: RoutePlan | null }) {
+function Legend({ layer, verify, slot, plan, live }: { layer: RasterLayer; verify: boolean; slot: number; plan: RoutePlan | null; live: boolean }) {
   return (
     <div className="legend">
       {layer === 'sic' && (
@@ -417,7 +452,11 @@ function Legend({ layer, verify, slot, plan }: { layer: RasterLayer; verify: boo
             {slot === 0 ? "Yesterday's +24 h forecast − today's analysis" : `Forecast − truth at +${slot * 24} h`}
           </div>
           <div className="legend-note">
-            {slot === 0 ? 'Real-time check: needs no future data.' : 'Hindcast only: the truth is not yet observed in live use.'}
+            {slot === 0
+              ? 'Real-time check: needs no future data.'
+              : live
+                ? 'Not available live: this time has not happened yet. Use Now for the real-time check.'
+                : 'Hindcast only: the truth is not yet observed in live use.'}
           </div>
           <div className="legend-item">
             <i style={{ background: '#f05a5a' }} />
