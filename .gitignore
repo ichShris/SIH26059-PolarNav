@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+frontend/node_modules/
+frontend/dist/
+# regenerated on first run (~3 min); model weights and metrics ARE committed
+backend/artifacts/world_*.npz
+*.log
